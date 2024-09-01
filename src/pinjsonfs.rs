@@ -318,6 +318,73 @@ impl Filesystem for Pin<Box<JsonFS>> {
         reply.ok();
     }
 
+    fn mkdir(
+        &mut self,
+        _req: &Request<'_>,
+        parent: u64,
+        name: &OsStr,
+        _mode: u32,
+        _umask: u32,
+        reply: ReplyEntry,
+    ) {
+        debug!(slog_scope::logger(), "Filesystem func";
+            "op" => "mkdir", "io"=> "in", "parent" => parent, "name" => name.to_str().unwrap());
+
+        if let Some(Inode { value, .. }) = self.ino2inode.get(&parent) {
+            let parent = unsafe { value.as_mut().unwrap() };
+            match parent {
+                Value::Object(map) => {
+                    map.iter()
+                        .map(|(_, v)| v as *const Value as u64)
+                        .for_each(|ino| {
+                            self.as_mut().ino2inode_mut().remove(&ino);
+                        });
+
+                    let value = map
+                        .entry(name.to_str().unwrap().to_string())
+                        .or_insert(serde_json::json!({}));
+                    let attr = self.create_attr(value as *mut Value as u64, value);
+                    map.iter_mut().for_each(|(_, v)| {
+                        let ino = v as *const Value as u64;
+                        self.as_mut().ino2inode_mut().insert(
+                            ino,
+                            Inode {
+                                ino,
+                                value: v as *mut Value,
+                            },
+                        );
+                    });
+                    reply.entry(&Duration::new(1, 0), &attr, 0);
+                }
+                Value::Array(vec) => {
+                    vec.iter()
+                        .map(|v| v as *const Value as u64)
+                        .for_each(|ino| {
+                            self.as_mut().ino2inode_mut().remove(&ino);
+                        });
+                    vec.push(serde_json::json!({}));
+                    let value = vec.last_mut().unwrap();
+                    let attr = self.create_attr(value as *mut Value as u64, value);
+                    vec.iter_mut().for_each(|v| {
+                        let ino = v as *const Value as u64;
+                        self.as_mut().ino2inode_mut().insert(
+                            ino,
+                            Inode {
+                                ino,
+                                value: v as *mut Value,
+                            },
+                        );
+                    });
+                    reply.entry(&Duration::new(1, 0), &attr, 0);
+                }
+                _ => {}
+            }
+        } else {
+            warn!(slog_scope::logger(), "Filesystem func not found inode of parent"; "op" => "mkdir", "io"=> "in", "parent" => parent, "name" => name.to_str().unwrap());
+            reply.error(libc::ENOENT);
+            return;
+        }
+    }
     fn write(
         &mut self,
         _req: &Request<'_>,
@@ -381,6 +448,23 @@ impl Filesystem for Pin<Box<JsonFS>> {
             };
             match parent_value {
                 Value::Object(map) => {
+                    if map.len() == 0 && name.to_str().unwrap().parse::<u64>() == Ok(0) {
+                        *parent_value = serde_json::json!([""]);
+                        let child = parent_value.as_array_mut().unwrap().last_mut().unwrap();
+                        let child_ino = child as *mut Value as u64;
+                        self.as_mut().ino2inode_mut().insert(
+                            child_ino,
+                            Inode {
+                                value: child as *mut Value,
+                                ino: child_ino,
+                            },
+                        );
+                        let attr = self.create_attr(child as *mut Value as u64, child);
+                        reply.created(&Duration::new(1, 0), &attr, 0, 0, 0);
+
+                        return;
+                    }
+
                     map.iter()
                         .map(|(_, v)| v as *const Value as u64)
                         .for_each(|ino| {
@@ -415,6 +499,26 @@ impl Filesystem for Pin<Box<JsonFS>> {
                     return;
                 }
                 Value::Array(vec) => {
+                    if vec.len() == 0 && name.to_str().unwrap().parse::<u64>() != Ok(0) {
+                        *parent_value = serde_json::json!({name.to_str().unwrap():""});
+                        let child = parent_value
+                            .as_object_mut()
+                            .unwrap()
+                            .get_mut(name.to_str().unwrap())
+                            .unwrap();
+                        let child_ino = child as *mut Value as u64;
+                        self.as_mut().ino2inode_mut().insert(
+                            child_ino,
+                            Inode {
+                                value: child as *mut Value,
+                                ino: child_ino,
+                            },
+                        );
+                        let attr = self.create_attr(child_ino, child);
+                        reply.created(&Duration::new(1, 0), &attr, 0, 0, 0);
+                        return;
+                    }
+
                     let index = name.to_str().unwrap().parse::<usize>();
                     if index.is_err() {
                         warn!(slog_scope::logger(), "Filesystem func"; 
